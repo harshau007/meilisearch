@@ -384,7 +384,8 @@ fn import_dump(
         log::info!("All documents successfully imported.");
     }
 
-    let mut index_scheduler_dump = index_scheduler.register_dumped_task()?;
+    let env = index_scheduler.env();
+    let mut index_scheduler_dump = index_scheduler.register_dumped_task(&env)?;
 
     // 5. Import the tasks.
     for ret in dump_reader.tasks()? {

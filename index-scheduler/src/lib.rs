@@ -32,7 +32,7 @@ mod uuid_codec;
 pub type Result<T> = std::result::Result<T, Error>;
 pub type TaskId = u32;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -274,11 +274,55 @@ pub struct IndexSchedulerOptions {
     pub zk: Option<zk::Client>,
 }
 
+#[derive(Clone)]
+struct EnvSwapper {
+    env: Arc<RwLock<Option<Env>>>,
+    base_path: PathBuf,
+    create: Arc<dyn Fn(&Path) -> Env + Send + Sync + 'static>,
+}
+
+impl EnvSwapper {
+    pub fn new(path: PathBuf, create: impl Fn(&Path) -> Env + Send + Sync + 'static) -> Self {
+        let env = create(&path);
+        Self { env: Arc::new(RwLock::new(Some(env))), base_path: path, create: Arc::new(create) }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.base_path
+    }
+
+    /// Swap the current env with a new one.
+    /// It MUST be able to move (via `std::fs::rename`) the file.
+    /// Since there will be downtime where the env won't be accessible,
+    /// it is recommended to only run this operation when the new
+    /// database is on the same disk partition as the old one.
+    ///
+    /// If there was any opened database on the previous env, you must
+    /// reopen them with the new env.
+    pub fn swap_with(&self, path: &Path) {
+        // Wait until every reader are out and take the mutex to ensure we're alone.
+        let mut lock = self.env.write().unwrap();
+        let env = std::mem::take(&mut *lock).unwrap();
+        // Then closing the env should be instantaneous.
+        log::debug!("swapping env: Prepare for closing");
+        env.prepare_for_closing().wait();
+        log::debug!("swapping env: The env has been closed");
+        std::fs::rename(path, &self.base_path.join("data.mdb")).unwrap();
+        log::debug!("swapping env: opening the new env");
+        *lock = Some((self.create)(&self.base_path));
+    }
+
+    /// Returns the env. May block if we're currently loading a snapshot.
+    pub fn env(&self) -> Env {
+        self.env.read().unwrap().clone().unwrap()
+    }
+}
+
 /// Structure which holds meilisearch's indexes and schedules the tasks
 /// to be performed on them.
 pub struct IndexScheduler {
     /// The LMDB environment which the DBs are associated with.
-    pub(crate) env: Env,
+    pub(crate) env: EnvSwapper,
 
     /// A boolean that can be set to true to stop the currently processing tasks.
     pub(crate) must_stop_processing: MustStopProcessing,
@@ -430,10 +474,11 @@ impl IndexScheduler {
             )
         };
 
-        let env = heed::EnvOpenOptions::new()
-            .max_dbs(11)
-            .map_size(budget.task_db_size)
-            .open(options.tasks_path)?;
+        let task_db_size = budget.task_db_size;
+        let envswapper = EnvSwapper::new(options.tasks_path, move |path: &Path| {
+            heed::EnvOpenOptions::new().max_dbs(11).map_size(task_db_size).open(path).unwrap()
+        });
+        let env = envswapper.env();
 
         let features = features::FeatureData::new(&env, options.instance_features)?;
 
@@ -472,7 +517,7 @@ impl IndexScheduler {
                 options.enable_mdb_writemap,
                 options.indexer_config,
             )?,
-            env,
+            env: envswapper,
             // we want to start the loop right away in case meilisearch was ctrl+Ced while processing things
             wake_up: Arc::new(SignalEvent::auto(true)),
             autobatching_enabled: options.autobatching_enabled,
@@ -508,9 +553,14 @@ impl IndexScheduler {
         Ok(this)
     }
 
+    pub fn env(&self) -> Env {
+        self.env.env()
+    }
+
     /// Return `Ok(())` if the index scheduler is able to access one of its database.
     pub fn health(&self) -> Result<()> {
-        let rtxn = self.env.read_txn()?;
+        let env = self.env();
+        let rtxn = env.read_txn()?;
         self.all_tasks.first(&rtxn)?;
         Ok(())
     }
@@ -582,10 +632,6 @@ impl IndexScheduler {
             // However transient errors are: 1) less likely than persistent errors 2) likely to cause other issues down the line anyway.
             false
         }
-    }
-
-    pub fn read_txn(&self) -> Result<RoTxn> {
-        self.env.read_txn().map_err(|e| e.into())
     }
 
     /// Start the run loop for the given index scheduler.
@@ -693,12 +739,12 @@ impl IndexScheduler {
                                     log::info!("Downloading the index scheduler database.");
                                     let tasks_snapshot =
                                             snapshot_dir.join("tasks.mdb");
-                                    std::fs::copy(tasks_snapshot, tasks_file).unwrap();
+                                    std::fs::copy(&tasks_snapshot, tasks_file).unwrap();
 
 
                                     log::info!("Downloading the indexes databases");
                                     let indexes_files = tempfile::TempDir::new_in(&run.index_mapper.base_path).unwrap();
-                                    let mut indexes = Vec::new();
+                                    let mut indexes = HashSet::new();
 
                                     let dst = snapshot_dir.join("indexes");
                                     let mut indexes_snapshot = tokio::fs::read_dir(&dst).await.unwrap();
@@ -706,12 +752,17 @@ impl IndexScheduler {
                                         let uuid = file.file_name().as_os_str().to_str().unwrap().to_string();
                                         log::info!("\tDownloading the index {}", uuid.to_string());
                                         std::fs::copy(dst.join(&uuid), indexes_files.path().join(&uuid)).unwrap();
-                                        indexes.push(uuid);
+                                        indexes.insert(uuid);
                                     }
 
-                                    // 3. Lock the index-mapper and close all the env
-                                    // TODO: continue here
+                                    // 3. Close and reload the index-scheduler
 
+                                    run.env.swap_with(&tasks_snapshot);
+                                    let env = run.env();
+                                    env.read_txn().unwrap();
+                                    // TODO: Reopen all the databases with the new env
+
+                                    // 3. Swap all the indexes
 
 
                                     // run.env.close();
@@ -767,17 +818,13 @@ impl IndexScheduler {
                                     tokio::fs::copy(&run.version_file_path, dst).await.unwrap();
 
                                     // 2. Snapshot the index-scheduler LMDB env
-                                    let dst = snapshot_dir.join("tasks");
-                                    tokio::fs::create_dir_all(&dst).await.unwrap();
 
                                     log::info!("Snapshotting the tasks");
-                                    let env = run.env.clone();
+                                    let env = run.env().clone();
+                                    let dst = snapshot_dir.join("tasks.mdb");
                                     tokio::task::spawn_blocking(move || {
-                                        env.copy_to_path(
-                                            dst.join("tasks.mdb"),
-                                            heed::CompactionOption::Enabled,
-                                        )
-                                        .unwrap();
+                                        env.copy_to_path(dst, heed::CompactionOption::Enabled)
+                                            .unwrap();
                                     })
                                     .await
                                     .unwrap();
@@ -789,7 +836,8 @@ impl IndexScheduler {
 
                                     let this = run.private_clone();
                                     let indexes = tokio::task::spawn_blocking(move || {
-                                        let rtxn = this.env.read_txn().unwrap();
+                                        let env = this.env();
+                                        let rtxn = env.read_txn().unwrap();
                                         this.index_mapper
                                             .index_mapping
                                             .iter(&rtxn)
@@ -805,7 +853,8 @@ impl IndexScheduler {
                                         let this = run.private_clone();
                                         let dst = dst.clone();
                                         tokio::task::spawn_blocking(move || {
-                                            let rtxn = this.env.read_txn().unwrap();
+                                            let env = this.env();
+                                            let rtxn = env.read_txn().unwrap();
                                             let index =
                                                 this.index_mapper.index(&rtxn, &name).unwrap();
                                             index
@@ -893,7 +942,8 @@ impl IndexScheduler {
 
                                 let this = self.private_clone();
                                 tokio::task::spawn_blocking(move || {
-                                    let mut wtxn = this.env.write_txn().unwrap();
+                                    let env = this.env();
+                                    let mut wtxn = env.write_txn().unwrap();
                                     this.register_raw_task(&mut wtxn, &task).unwrap();
                                     wtxn.commit().unwrap();
                                     // we received a new tasks, we must wake up
@@ -932,7 +982,8 @@ impl IndexScheduler {
 
                             let this = this.private_clone();
                             tokio::task::spawn_blocking(move || {
-                                let mut wtxn = this.env.write_txn().unwrap();
+                                let env = this.env();
+                                let mut wtxn = env.write_txn().unwrap();
                                 this.register_raw_task(&mut wtxn, &task).unwrap();
                                 wtxn.commit().unwrap();
                             })
@@ -953,12 +1004,12 @@ impl IndexScheduler {
 
     /// Return the real database size (i.e.: The size **with** the free pages)
     pub fn size(&self) -> Result<u64> {
-        Ok(self.env.real_disk_size()?)
+        Ok(self.env().real_disk_size()?)
     }
 
     /// Return the used database size (i.e.: The size **without** the free pages)
     pub fn used_size(&self) -> Result<u64> {
-        Ok(self.env.non_free_pages_size()?)
+        Ok(self.env().non_free_pages_size()?)
     }
 
     /// Return the index corresponding to the name.
@@ -975,13 +1026,15 @@ impl IndexScheduler {
     /// If you need to fetch information from or perform an action on all indexes,
     /// see the `try_for_each_index` function.
     pub fn index(&self, name: &str) -> Result<Index> {
-        let rtxn = self.env.read_txn()?;
+        let env = self.env();
+        let rtxn = env.read_txn()?;
         self.index_mapper.index(&rtxn, name)
     }
 
     /// Return the name of all indexes without opening them.
     pub fn index_names(&self) -> Result<Vec<String>> {
-        let rtxn = self.env.read_txn()?;
+        let env = self.env();
+        let rtxn = env.read_txn()?;
         self.index_mapper.index_names(&rtxn)
     }
 
@@ -999,7 +1052,8 @@ impl IndexScheduler {
     where
         V: FromIterator<U>,
     {
-        let rtxn = self.env.read_txn()?;
+        let env = self.env();
+        let rtxn = env.read_txn()?;
         self.index_mapper.try_for_each_index(&rtxn, f)
     }
 
@@ -1145,7 +1199,8 @@ impl IndexScheduler {
     /// 2. The name of the specific data related to the property can be `enqueued` for the `statuses`, `settingsUpdate` for the `types`, or the name of the index for the `indexes`, for example.
     /// 3. The number of times the properties appeared.
     pub fn get_stats(&self) -> Result<BTreeMap<String, BTreeMap<String, u64>>> {
-        let rtxn = self.read_txn()?;
+        let env = self.env();
+        let rtxn = env.read_txn()?;
 
         let mut res = BTreeMap::new();
 
@@ -1180,7 +1235,8 @@ impl IndexScheduler {
     /// Return true iff there is at least one task associated with this index
     /// that is processing.
     pub fn is_index_processing(&self, index: &str) -> Result<bool> {
-        let rtxn = self.env.read_txn()?;
+        let env = self.env();
+        let rtxn = env.read_txn()?;
         let processing_tasks = self.processing_tasks.read().unwrap().processing.clone();
         let index_tasks = self.index_tasks(&rtxn, index)?;
         let nbr_index_processing_tasks = processing_tasks.intersection_len(&index_tasks);
@@ -1247,7 +1303,8 @@ impl IndexScheduler {
         query: Query,
         filters: &meilisearch_auth::AuthFilter,
     ) -> Result<(Vec<Task>, u64)> {
-        let rtxn = self.env.read_txn()?;
+        let env = self.env();
+        let rtxn = env.read_txn()?;
 
         let (tasks, total) = self.get_task_ids_from_authorized_indexes(&rtxn, &query, filters)?;
         let tasks = self.get_existing_tasks(
@@ -1295,11 +1352,12 @@ impl IndexScheduler {
 
         let this = self.private_clone();
         let task = tokio::task::spawn_blocking(move || {
-            let mut wtxn = this.env.write_txn()?;
+            let env = this.env();
+            let mut wtxn = env.write_txn()?;
 
             // if the task doesn't delete anything and 50% of the task queue is full, we must refuse to enqueue the incomming task
             if !matches!(&kind, KindWithContent::TaskDeletion { tasks, .. } if !tasks.is_empty())
-                && (this.env.non_free_pages_size()? * 100) / this.env.map_size()? as u64 > 50
+                && (env.non_free_pages_size()? * 100) / env.map_size()? as u64 > 50
             {
                 return Err(Error::NoSpaceLeftInTaskQueue);
             }
@@ -1395,8 +1453,8 @@ impl IndexScheduler {
 
     /// Register a new task coming from a dump in the scheduler.
     /// By taking a mutable ref we're pretty sure no one will ever import a dump while actix is running.
-    pub fn register_dumped_task(&mut self) -> Result<Dump> {
-        Dump::new(self)
+    pub fn register_dumped_task<'a>(&'a mut self, env: &'a Env) -> Result<Dump<'a>> {
+        Dump::new(self, env)
     }
 
     /// Create a new index without any associated task.
@@ -1405,7 +1463,8 @@ impl IndexScheduler {
         name: &str,
         date: Option<(OffsetDateTime, OffsetDateTime)>,
     ) -> Result<Index> {
-        let wtxn = self.env.write_txn()?;
+        let env = self.env();
+        let wtxn = env.write_txn()?;
         let index = self.index_mapper.create_index(wtxn, name, date)?;
         Ok(index)
     }
@@ -1460,7 +1519,8 @@ impl IndexScheduler {
 
         self.cleanup_task_queue().await?;
 
-        let rtxn = self.env.read_txn().map_err(Error::HeedTransaction)?;
+        let env = self.env();
+        let rtxn = env.read_txn().map_err(Error::HeedTransaction)?;
         let batch =
             match self.create_next_batch(&rtxn).map_err(|e| Error::CreateBatch(Box::new(e)))? {
                 Some(batch) => batch,
@@ -1496,7 +1556,7 @@ impl IndexScheduler {
         #[cfg(test)]
         self.maybe_fail(tests::FailureLocation::AcquiringWtxn)?;
 
-        let mut wtxn = self.env.write_txn().map_err(Error::HeedTransaction)?;
+        let mut wtxn = env.write_txn().map_err(Error::HeedTransaction)?;
 
         let finished_at = OffsetDateTime::now_utc();
         match res {
@@ -1598,7 +1658,8 @@ impl IndexScheduler {
 
     /// Register a task to cleanup the task queue if needed
     async fn cleanup_task_queue(&self) -> Result<()> {
-        let rtxn = self.env.read_txn().map_err(Error::HeedTransaction)?;
+        let env = self.env();
+        let rtxn = env.read_txn().map_err(Error::HeedTransaction)?;
 
         let nb_tasks = self.all_task_ids(&rtxn)?.len();
         // if we have less than 1M tasks everything is fine
@@ -1648,19 +1709,22 @@ impl IndexScheduler {
 
     pub fn index_stats(&self, index_uid: &str) -> Result<IndexStats> {
         let is_indexing = self.is_index_processing(index_uid)?;
-        let rtxn = self.read_txn()?;
+        let env = self.env();
+        let rtxn = env.read_txn()?;
         let index_stats = self.index_mapper.stats_of(&rtxn, index_uid)?;
 
         Ok(IndexStats { is_indexing, inner_stats: index_stats })
     }
 
     pub fn features(&self) -> Result<RoFeatures> {
-        let rtxn = self.read_txn()?;
+        let env = self.env();
+        let rtxn = env.read_txn()?;
         self.features.features(rtxn)
     }
 
     pub fn put_runtime_features(&self, features: RuntimeTogglableFeatures) -> Result<()> {
-        let wtxn = self.env.write_txn().map_err(Error::HeedTransaction)?;
+        let env = self.env();
+        let wtxn = env.write_txn().map_err(Error::HeedTransaction)?;
         self.features.put_runtime_features(wtxn, features)?;
         Ok(())
     }
@@ -1707,9 +1771,9 @@ pub struct Dump<'a> {
 }
 
 impl<'a> Dump<'a> {
-    pub(crate) fn new(index_scheduler: &'a mut IndexScheduler) -> Result<Self> {
+    pub(crate) fn new(index_scheduler: &'a mut IndexScheduler, env: &'a Env) -> Result<Self> {
         // While loading a dump no one should be able to access the scheduler thus I can block everything.
-        let wtxn = index_scheduler.env.write_txn()?;
+        let wtxn = env.write_txn()?;
 
         Ok(Dump {
             index_scheduler,

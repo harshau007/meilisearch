@@ -324,8 +324,9 @@ async fn cancel_tasks(
 
     let query = params.into_query();
 
+    let env = index_scheduler.env();
     let (tasks, _) = index_scheduler.get_task_ids_from_authorized_indexes(
-        &index_scheduler.read_txn()?,
+        &env.read_txn()?,
         &query,
         index_scheduler.filters(),
     )?;
@@ -369,8 +370,9 @@ async fn delete_tasks(
     );
     let query = params.into_query();
 
+    let env = index_scheduler.env();
     let (tasks, _) = index_scheduler.get_task_ids_from_authorized_indexes(
-        &index_scheduler.read_txn()?,
+        &env.read_txn()?,
         &query,
         index_scheduler.filters(),
     )?;
